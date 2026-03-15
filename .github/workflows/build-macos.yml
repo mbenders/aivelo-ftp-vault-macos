@@ -1,0 +1,251 @@
+# ═══════════════════════════════════════════════════════════
+#  Aivelo FTP Vault — macOS Build Pipeline
+#  
+#  Triggers on:
+#    • Push a tag like v2.1.0  →  builds + creates GitHub Release with DMG
+#    • Manual dispatch          →  builds for testing (no release)
+#
+#  Produces:
+#    • Aivelo FTP Vault.app  (inside a DMG)
+#    • Both Apple Silicon (arm64) and Intel (x86_64) builds
+# ═══════════════════════════════════════════════════════════
+
+name: Build macOS App
+
+on:
+  push:
+    tags:
+      - 'v*'            # Trigger on version tags: v2.1.0, v2.2.0-beta, etc.
+  workflow_dispatch:     # Allow manual trigger from GitHub UI
+    inputs:
+      version:
+        description: 'Version label (e.g. 2.1.0-dev)'
+        required: false
+        default: 'dev'
+
+permissions:
+  contents: write        # Needed to create GitHub Releases
+
+env:
+  APP_NAME: "Aivelo FTP Vault"
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  #  Build on macOS (runs on GitHub's macOS runners)
+  # ─────────────────────────────────────────────────────────
+  build-macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14          # Apple Silicon (M1) runner
+            arch: arm64
+            label: "Apple Silicon"
+          - runner: macos-13          # Intel runner
+            arch: x86_64
+            label: "Intel"
+
+    runs-on: ${{ matrix.runner }}
+    name: Build — ${{ matrix.label }} (${{ matrix.arch }})
+
+    steps:
+      # ── Checkout code ───────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Determine version ───────────────────────────────
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION="${{ github.ref_name }}"
+            VERSION="${VERSION#v}"    # Strip leading 'v'
+          else
+            VERSION="${{ github.event.inputs.version || 'dev' }}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "📦 Building version: ${VERSION}"
+
+      # ── Set up Python ───────────────────────────────────
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # ── Cache pip packages ──────────────────────────────
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: ${{ matrix.runner }}-pip-${{ hashFiles('requirements-build.txt') }}
+          restore-keys: |
+            ${{ matrix.runner }}-pip-
+
+      # ── Install dependencies ────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements-build.txt
+
+      # ── Generate .icns icon ─────────────────────────────
+      - name: Generate macOS icon
+        run: |
+          if [[ -f "icon.png" ]]; then
+            echo "Converting icon.png → aivelo.icns"
+            chmod +x generate_icns.sh
+            ./generate_icns.sh icon.png aivelo.icns
+          elif [[ -f "aivelo.icns" ]]; then
+            echo "Using existing aivelo.icns"
+          else
+            echo "⚠️ No icon found — building with default icon"
+          fi
+
+      # ── Update version in spec ──────────────────────────
+      - name: Patch version into spec
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i '' "s/version='2.1.0'/version='${VERSION}'/" AiveloFTP.spec
+          sed -i '' "s/'CFBundleShortVersionString':  '2.1.0'/'CFBundleShortVersionString':  '${VERSION}'/" AiveloFTP.spec
+          sed -i '' "s/'CFBundleVersion':             '2.1.0'/'CFBundleVersion':             '${VERSION}'/" AiveloFTP.spec
+
+      # ── Build with PyInstaller ──────────────────────────
+      - name: Build .app bundle
+        run: |
+          pyinstaller AiveloFTP.spec --noconfirm --clean
+          
+          # Verify the build
+          APP_PATH="dist/${{ env.APP_NAME }}.app"
+          if [[ ! -d "$APP_PATH" ]]; then
+            echo "❌ Build failed — .app not found"
+            exit 1
+          fi
+          
+          echo "✅ Built successfully"
+          du -sh "$APP_PATH"
+
+      # ── Optional: Code sign ─────────────────────────────
+      - name: Code sign (if certificate available)
+        if: env.MACOS_CERTIFICATE != ''
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_KEYCHAIN_PWD: ${{ secrets.MACOS_KEYCHAIN_PWD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          # Decode and import certificate
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          
+          # Create temporary keychain
+          security create-keychain -p "$MACOS_KEYCHAIN_PWD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PWD" build.keychain
+          security import certificate.p12 -k build.keychain \
+            -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$MACOS_KEYCHAIN_PWD" build.keychain
+          
+          # Sign the app
+          codesign --force --deep --options runtime \
+            --sign "$MACOS_SIGNING_IDENTITY" \
+            "dist/${{ env.APP_NAME }}.app"
+          
+          echo "✅ Code signed"
+          
+          # Clean up
+          rm -f certificate.p12
+
+      # ── Create DMG ──────────────────────────────────────
+      - name: Create DMG
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          DMG_NAME="AiveloFTP-${VERSION}-${{ matrix.arch }}.dmg"
+          
+          # Create a nice DMG with the app and an Applications symlink
+          mkdir -p dmg-staging
+          cp -R "dist/${{ env.APP_NAME }}.app" dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+          
+          hdiutil create \
+            -volname "${{ env.APP_NAME }}" \
+            -srcfolder dmg-staging \
+            -ov \
+            -format UDZO \
+            "${DMG_NAME}"
+          
+          rm -rf dmg-staging
+          
+          echo "dmg_name=${DMG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "✅ DMG created: ${DMG_NAME}"
+          ls -lh "${DMG_NAME}"
+        id: dmg
+
+      # ── Optional: Notarize ──────────────────────────────
+      - name: Notarize DMG (if credentials available)
+        if: env.NOTARY_APPLE_ID != ''
+        env:
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+        run: |
+          DMG_NAME="${{ steps.dmg.outputs.dmg_name }}"
+          
+          xcrun notarytool submit "${DMG_NAME}" \
+            --apple-id "$NOTARY_APPLE_ID" \
+            --team-id "$NOTARY_TEAM_ID" \
+            --password "$NOTARY_PASSWORD" \
+            --wait
+          
+          xcrun stapler staple "${DMG_NAME}"
+          echo "✅ Notarization complete"
+
+      # ── Upload artifact ─────────────────────────────────
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AiveloFTP-${{ matrix.arch }}
+          path: ${{ steps.dmg.outputs.dmg_name }}
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────
+  #  Create GitHub Release (only on tag push)
+  # ─────────────────────────────────────────────────────────
+  release:
+    needs: build-macos
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    name: Create Release
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f -name "*.dmg" | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Aivelo FTP Vault ${{ github.ref_name }}"
+          body: |
+            ## 🏰 Aivelo FTP Vault ${{ github.ref_name }}
+            
+            ### macOS Downloads
+            
+            | Build | Architecture | For |
+            |-------|-------------|-----|
+            | **Apple Silicon** | `arm64` | MacBook Air/Pro M1–M4, iMac M1+ |
+            | **Intel** | `x86_64` | Older MacBook/iMac (pre-2020) |
+            
+            ### Installation
+            1. Download the `.dmg` for your Mac
+            2. Open the DMG and drag **Aivelo FTP Vault** to **Applications**
+            3. On first launch: right-click → Open (to bypass Gatekeeper if unsigned)
+            
+            ### What's New
+            - See [CHANGELOG.md](CHANGELOG.md) for details
+          files: |
+            artifacts/**/*.dmg
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'rc') }}

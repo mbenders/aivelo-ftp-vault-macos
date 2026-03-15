@@ -1,0 +1,18 @@
+# ═══════════════════════════════════════════════════════════
+#  Aivelo FTP Vault — macOS Build Dependencies
+#  Used by: GitHub Actions CI + local build.sh
+# ═══════════════════════════════════════════════════════════
+
+# ── App runtime dependencies ──────────────────────────────
+flask>=3.0,<4.0
+paramiko>=3.4,<4.0
+cryptography>=42.0,<44.0
+
+# ── macOS native webview ──────────────────────────────────
+pywebview>=5.0,<6.0
+pyobjc-core>=10.0
+pyobjc-framework-Cocoa>=10.0
+pyobjc-framework-WebKit>=10.0
+
+# ── Build tool ────────────────────────────────────────────
+pyinstaller>=6.0,<7.0
