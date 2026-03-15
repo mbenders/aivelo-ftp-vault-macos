@@ -7,7 +7,7 @@
 #
 #  Produces:
 #    • Aivelo FTP Vault.app  (inside a DMG)
-#    • Both Apple Silicon (arm64) and Intel (x86_64) builds
+#    • Apple Silicon (arm64) build for M1–M4 Macs
 # ═══════════════════════════════════════════════════════════
 
 name: Build macOS App
@@ -35,18 +35,8 @@ jobs:
   #  Build on macOS (runs on GitHub's macOS runners)
   # ─────────────────────────────────────────────────────────
   build-macos:
-    strategy:
-      matrix:
-        include:
-          - runner: macos-14          # Apple Silicon (M1) runner
-            arch: arm64
-            label: "Apple Silicon"
-          - runner: macos-13          # Intel runner
-            arch: x86_64
-            label: "Intel"
-
-    runs-on: ${{ matrix.runner }}
-    name: Build — ${{ matrix.label }} (${{ matrix.arch }})
+    runs-on: macos-14             # Apple Silicon (M1) runner — free tier
+    name: Build — Apple Silicon (arm64)
 
     steps:
       # ── Checkout code ───────────────────────────────────
@@ -77,9 +67,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/Library/Caches/pip
-          key: ${{ matrix.runner }}-pip-${{ hashFiles('requirements-build.txt') }}
+          key: macos-14-pip-${{ hashFiles('requirements-build.txt') }}
           restore-keys: |
-            ${{ matrix.runner }}-pip-
+            macos-14-pip-
 
       # ── Install dependencies ────────────────────────────
       - name: Install dependencies
@@ -158,7 +148,7 @@ jobs:
       - name: Create DMG
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          DMG_NAME="AiveloFTP-${VERSION}-${{ matrix.arch }}.dmg"
+          DMG_NAME="AiveloFTP-${VERSION}-arm64.dmg"
           
           # Create a nice DMG with the app and an Applications symlink
           mkdir -p dmg-staging
@@ -202,7 +192,7 @@ jobs:
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AiveloFTP-${{ matrix.arch }}
+          name: AiveloFTP-arm64
           path: ${{ steps.dmg.outputs.dmg_name }}
           retention-days: 30
 
@@ -231,15 +221,14 @@ jobs:
           body: |
             ## 🏰 Aivelo FTP Vault ${{ github.ref_name }}
             
-            ### macOS Downloads
+            ### macOS Download
             
             | Build | Architecture | For |
             |-------|-------------|-----|
             | **Apple Silicon** | `arm64` | MacBook Air/Pro M1–M4, iMac M1+ |
-            | **Intel** | `x86_64` | Older MacBook/iMac (pre-2020) |
             
             ### Installation
-            1. Download the `.dmg` for your Mac
+            1. Download the `.dmg` file
             2. Open the DMG and drag **Aivelo FTP Vault** to **Applications**
             3. On first launch: right-click → Open (to bypass Gatekeeper if unsigned)
             
